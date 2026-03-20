@@ -10,7 +10,7 @@ class AbstractNode[Input: BaseModel, Output: BaseModel](ABC):
     out_type: frozenset[Message]
 
     @abstractmethod
-    def run(self, input: Input) -> Output: ...
+    async def run(self, input: Input) -> Output: ...
 
 
 def mk_node[In: BaseModel, Out: BaseModel](
@@ -21,11 +21,11 @@ def mk_node[In: BaseModel, Out: BaseModel](
     Return a base class for a node with declared input type In and output type Out.
 
         class MyNode(mk_node(MyInput, MyOutput)):
-            def run(self, input: MyInput) -> MyOutput:
+            async def run(self, input: MyInput) -> MyOutput:
                 ...
 
         class MyNode(mk_node(MyInput, {MyOutputA, MyOutputB})):
-            def run(self, input: MyInput) -> MyOutputA | MyOutputB:
+            async def run(self, input: MyInput) -> MyOutputA | MyOutputB:
                 ...
 
     The generated class carries In and Out as plain class attributes (in_type, out_type),
@@ -36,6 +36,6 @@ def mk_node[In: BaseModel, Out: BaseModel](
         out_type = frozenset({output_type}) if isinstance(output_type, type) else frozenset(output_type)
 
         @abstractmethod
-        def run(self, input: In) -> Out: ...
+        async def run(self, input: In) -> Out: ...
 
     return Node
