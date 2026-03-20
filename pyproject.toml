@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ariadne"
+version = "0.1.0"
+description = "A framework for defining, executing, and resuming typed state transition systems for AI agent workflows"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.151.9",
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+]
