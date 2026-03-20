@@ -1,5 +1,7 @@
 """Property-based tests over randomly generated DAG-shaped graphs."""
+import asyncio
 import itertools
+import time
 
 import pytest
 from hypothesis import assume, given
@@ -31,7 +33,7 @@ def make_raising_node(in_type, out_type_set):
     out_arg = next(iter(out_type_set)) if len(out_type_set) == 1 else out_type_set
 
     class RaisingNode(mk_node(in_type, out_arg)):  # type: ignore[misc]
-        def run(self, input):
+        async def run(self, input):
             raise RuntimeError("deliberate test error")
 
     return RaisingNode()
@@ -44,7 +46,7 @@ def make_node(in_type, out_type_set):
     out_arg   = next(iter(out_type_set)) if len(out_type_set) == 1 else out_type_set
 
     class TestNode(mk_node(in_type, out_arg)):  # type: ignore[misc]
-        def run(self, input):
+        async def run(self, input):
             return first_out()
 
     return TestNode()
@@ -104,40 +106,40 @@ def graph_strategy(draw):
 
 @given(graph_strategy())
 def test_trace_ends_at_sink(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     assert trace[-1].successor_id is None
 
 
 @given(graph_strategy())
 def test_trace_successor_chain(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     for i in range(len(trace) - 1):
         assert trace[i].successor_id == trace[i + 1].node_id
 
 
 @given(graph_strategy())
 def test_trace_nodes_in_graph(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     assert all(e.node_id in graph.nodes for e in trace)
 
 
 @given(graph_strategy())
 def test_trace_input_types(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     assert all(isinstance(e.input, graph.nodes[e.node_id].in_type) for e in trace)
 
 
 @given(graph_strategy())
 def test_trace_output_types(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     assert all(type(e.output) in graph.nodes[e.node_id].out_type for e in trace)
 
 
 @given(graph_strategy())
 def test_resume_suffix_matches(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     for i, entry in enumerate(trace):
-        resumed = graph.resume(trace, entry.step_id)
+        resumed = asyncio.run(graph.resume(trace, entry.step_id))
         assert resumed[:i] == trace[:i]
         for orig, res in zip(trace[i:], resumed[i:]):
             assert orig.node_id      == res.node_id
@@ -152,7 +154,7 @@ def test_resume_suffix_matches(graph):
 
 @given(graph_strategy())
 def test_dump_load_roundtrip(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     restored, last_step_id = load_trace(dump_trace(trace), graph)
     assert restored == trace
     assert last_step_id == trace[-1].step_id
@@ -160,11 +162,11 @@ def test_dump_load_roundtrip(graph):
 
 @given(graph_strategy())
 def test_resume_after_load_matches(graph):
-    trace = graph.execute(graph.nodes[0].in_type())
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
     restored, _ = load_trace(dump_trace(trace), graph)
     for i, entry in enumerate(trace):
-        r1 = graph.resume(trace,    entry.step_id)
-        r2 = graph.resume(restored, entry.step_id)
+        r1 = asyncio.run(graph.resume(trace,    entry.step_id))
+        r2 = asyncio.run(graph.resume(restored, entry.step_id))
         for e1, e2 in zip(r1, r2):
             assert e1.node_id      == e2.node_id
             assert e1.input        == e2.input
@@ -248,7 +250,7 @@ def test_on_error_raise_propagates(in_t, out_t):
     graph    = Graph(nodes=nodes, topology=topology, initial=0,
                      id_factory=itertools.count().__next__, on_error='raise')
     with pytest.raises(RuntimeError, match="deliberate test error"):
-        graph.execute(in_t())
+        asyncio.run(graph.execute(in_t()))
 
 
 @given(st.sampled_from(MSG_POOL), st.sampled_from(MSG_POOL))
@@ -257,7 +259,7 @@ def test_sink_local_routes_error(in_t, out_t):
     topology = {0: [1], 1: []}
     graph    = Graph(nodes=nodes, topology=topology, initial=0,
                      id_factory=itertools.count().__next__, on_error='sink-local')
-    trace = graph.execute(in_t())
+    trace = asyncio.run(graph.execute(in_t()))
     assert trace[-1].successor_id is None
     assert trace[-1].node_id == Error(node_id=0)
     assert isinstance(trace[-1].output, NodeError)
@@ -271,7 +273,7 @@ def test_sink_global_routes_error(in_t, out_t):
     topology = {0: [1], 1: []}
     graph    = Graph(nodes=nodes, topology=topology, initial=0,
                      id_factory=itertools.count().__next__, on_error='sink-global')
-    trace = graph.execute(in_t())
+    trace = asyncio.run(graph.execute(in_t()))
     assert trace[-1].successor_id is None
     assert trace[-1].node_id == Error(node_id=None)
     assert isinstance(trace[-1].output, NodeError)
@@ -282,15 +284,46 @@ def test_sink_global_routes_error(in_t, out_t):
 @given(st.sampled_from(MSG_POOL), st.sampled_from(MSG_POOL))
 def test_explicit_handler_routes_error(in_t, out_t):
     class ErrorHandler(mk_node(NodeError, NodeError)):  # type: ignore[misc]
-        def run(self, input: NodeError) -> NodeError:
+        async def run(self, input: NodeError) -> NodeError:
             return input
 
     nodes    = {0: make_raising_node(in_t, {out_t}), 1: make_node(out_t, {out_t}), 'handler': ErrorHandler()}
     topology = {0: [1], 1: [], 'handler': []}
     graph    = Graph(nodes=nodes, topology=topology, initial=0,
                      id_factory=itertools.count().__next__, on_error='handler')
-    trace = graph.execute(in_t())
+    trace = asyncio.run(graph.execute(in_t()))
     assert trace[-1].successor_id is None
     assert trace[-1].node_id == 'handler'
     assert isinstance(trace[-1].output, NodeError)
     assert trace[-1].output.exception_type == 'RuntimeError'
+
+
+# ---------------------------------------------------------------------------
+# Async
+# ---------------------------------------------------------------------------
+
+def test_concurrent_executions_interleave():
+    """Two graph executions running concurrently should take ~1× node latency, not ~2×."""
+    DELAY = 0.05
+
+    class SlowNode(mk_node(M0, M0)):  # type: ignore[misc]
+        async def run(self, input: M0) -> M0:
+            await asyncio.sleep(DELAY)
+            return M0()
+
+    graph = Graph(
+        nodes      = {0: SlowNode()},
+        topology   = {0: []},
+        initial    = 0,
+        id_factory = itertools.count().__next__,
+    )
+
+    async def run():
+        return await asyncio.gather(graph.execute(M0()), graph.execute(M0()))
+
+    t0      = time.monotonic()
+    results = asyncio.run(run())
+    elapsed = time.monotonic() - t0
+
+    assert len(results) == 2
+    assert elapsed < 1.5 * DELAY  # concurrent: ~DELAY; sequential would be ~2*DELAY

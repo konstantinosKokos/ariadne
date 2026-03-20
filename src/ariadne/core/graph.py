@@ -19,7 +19,7 @@ class Error[NodeId](BaseModel, frozen=True):
 
 
 class ErrorSink(mk_node(NodeError, NodeError)):  # type: ignore[misc]
-    def run(self, input: NodeError) -> NodeError:
+    async def run(self, input: NodeError) -> NodeError:
         return input
 
 
@@ -113,7 +113,7 @@ def dispatch[NodeId](
     return matched
 
 
-def run_from[StepId, NodeId](
+async def run_from[StepId, NodeId](
     nodes:      dict[NodeId, AbstractNode],
     topology:   dict[NodeId, list[NodeId]],
     id_factory: Callable[[], StepId],
@@ -126,7 +126,7 @@ def run_from[StepId, NodeId](
 
     while True:
         try:
-            output = nodes[current_name].run(current_input)
+            output = await nodes[current_name].run(current_input)
         except Exception as e:
             if not any(nodes[s].in_type is NodeError for s in topology[current_name]):
                 raise
@@ -148,7 +148,7 @@ def run_from[StepId, NodeId](
     return trace
 
 
-def resume[StepId, NodeId](
+async def resume[StepId, NodeId](
     nodes:      dict[NodeId, AbstractNode],
     topology:   dict[NodeId, list[NodeId]],
     id_factory: Callable[[], StepId],
@@ -161,7 +161,7 @@ def resume[StepId, NodeId](
     prefix = trace[:idx]
     entry  = trace[idx]
 
-    return prefix + run_from(nodes, topology, id_factory, entry.node_id, entry.input)
+    return prefix + await run_from(nodes, topology, id_factory, entry.node_id, entry.input)
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +221,13 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
         sinks         = [name for name, succs in topology.items() if not succs]
         self.out_type = frozenset(t for s in sinks for t in nodes[s].out_type)
 
-    def run(self, input: I) -> BaseModel:
+    async def run(self, input: I) -> BaseModel:
         """Node interface — used when this Graph is nested inside another."""
-        return run_from(self.nodes, self.topology, self.id_factory, self.initial, input)[-1].output
+        return (await run_from(self.nodes, self.topology, self.id_factory, self.initial, input))[-1].output
 
-    def execute(self, input: I) -> Trace[StepId, NodeId]:
+    async def execute(self, input: I) -> Trace[StepId, NodeId]:
         """Top-level execution — returns the full trace."""
-        return run_from(self.nodes, self.topology, self.id_factory, self.initial, input)
+        return await run_from(self.nodes, self.topology, self.id_factory, self.initial, input)
 
-    def resume(self, trace: Trace[StepId, NodeId], step_id: StepId) -> Trace[StepId, NodeId]:
-        return resume(self.nodes, self.topology, self.id_factory, trace, step_id)
+    async def resume(self, trace: Trace[StepId, NodeId], step_id: StepId) -> Trace[StepId, NodeId]:
+        return await resume(self.nodes, self.topology, self.id_factory, trace, step_id)
