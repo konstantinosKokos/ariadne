@@ -1,5 +1,6 @@
 """Property-based tests over randomly generated DAG-shaped graphs."""
 import asyncio
+import functools
 import itertools
 import time
 
@@ -8,12 +9,8 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
-from ariadne import Graph, mk_node, NodeError, Error, dump_trace, load_trace
+from ariadne import Graph, AbstractNode, NodeError, Metadata, Error, dump_trace, load_trace
 
-
-# ---------------------------------------------------------------------------
-# Fixed message type pool — no fields, default-constructable
-# ---------------------------------------------------------------------------
 
 class M0(BaseModel, frozen=True): pass
 class M1(BaseModel, frozen=True): pass
@@ -24,30 +21,30 @@ class M4(BaseModel, frozen=True): pass
 MSG_POOL = [M0, M1, M2, M3, M4]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _union(type_set):
+    return functools.reduce(lambda a, b: a | b, type_set)
 
-def make_raising_node(in_type, out_type_set):
+
+def make_raising_node(in_type, out_types_set):
     """Test node that always raises RuntimeError."""
-    out_arg = next(iter(out_type_set)) if len(out_type_set) == 1 else out_type_set
+    out_union = _union(out_types_set)
 
-    class RaisingNode(mk_node(in_type, out_arg)):  # type: ignore[misc]
+    class RaisingNode(AbstractNode[in_type, out_union]):  # type: ignore[misc]
         async def run(self, input):
             raise RuntimeError("deliberate test error")
 
     return RaisingNode()
 
 
-def make_node(in_type, out_type_set):
+def make_node(in_type, out_types_set):
     """Deterministic test node: always returns a default instance of the
-    lexicographically first type in out_type_set."""
-    first_out = min(out_type_set, key=lambda t: t.__name__)
-    out_arg   = next(iter(out_type_set)) if len(out_type_set) == 1 else out_type_set
+    lexicographically first type in out_types_set."""
+    first_out = min(out_types_set, key=lambda t: t.__name__)
+    out_union = _union(out_types_set)
 
-    class TestNode(mk_node(in_type, out_arg)):  # type: ignore[misc]
+    class TestNode(AbstractNode[in_type, out_union]):  # type: ignore[misc]
         async def run(self, input):
-            return first_out()
+            return first_out(), Metadata()
 
     return TestNode()
 
@@ -61,8 +58,8 @@ def make_node(in_type, out_type_set):
 # i < j, ensuring every node is reachable from 0.
 # Extra edges are added randomly (i < j only, preserving acyclicity).
 # Type assignment: each node i gets an in_type drawn from MSG_POOL.
-# out_type for non-sinks = union of in_types of successors (satisfies
-# assert_type_alignment exactly). Sinks re-use their own in_type as out_type.
+# out_types for non-sinks = union of in_types of successors (satisfies
+# assert_type_alignment exactly). Sinks re-use their own in_type as out_types.
 
 @st.composite
 def graph_components_strategy(draw):
@@ -83,8 +80,8 @@ def graph_components_strategy(draw):
     nodes = {}
     for i in range(n):
         succs        = topology[i]
-        out_type_set = {in_types[j] for j in succs} if succs else {in_types[i]}
-        nodes[i]     = make_node(in_types[i], out_type_set)
+        out_types_set = {in_types[j] for j in succs} if succs else {in_types[i]}
+        nodes[i]     = make_node(in_types[i], out_types_set)
 
     return nodes, topology
 
@@ -99,10 +96,6 @@ def graph_strategy(draw):
         id_factory = itertools.count().__next__,
     )
 
-
-# ---------------------------------------------------------------------------
-# Properties
-# ---------------------------------------------------------------------------
 
 @given(graph_strategy())
 def test_trace_ends_at_sink(graph):
@@ -132,7 +125,7 @@ def test_trace_input_types(graph):
 @given(graph_strategy())
 def test_trace_output_types(graph):
     trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
-    assert all(type(e.output) in graph.nodes[e.node_id].out_type for e in trace)
+    assert all(type(e.output) in graph.nodes[e.node_id].out_types for e in trace)
 
 
 @given(graph_strategy())
@@ -148,14 +141,10 @@ def test_resume_suffix_matches(graph):
             assert orig.successor_id == res.successor_id
 
 
-# ---------------------------------------------------------------------------
-# Logging roundtrip
-# ---------------------------------------------------------------------------
-
 @given(graph_strategy())
 def test_dump_load_roundtrip(graph):
     trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
-    restored, last_step_id = load_trace(dump_trace(trace), graph)
+    restored, last_step_id = load_trace(dump_trace(trace, lambda x: x, lambda x: x), graph, lambda x: x, lambda x: x)
     assert restored == trace
     assert last_step_id == trace[-1].step_id
 
@@ -163,7 +152,7 @@ def test_dump_load_roundtrip(graph):
 @given(graph_strategy())
 def test_resume_after_load_matches(graph):
     trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
-    restored, _ = load_trace(dump_trace(trace), graph)
+    restored, _ = load_trace(dump_trace(trace, lambda x: x, lambda x: x), graph, lambda x: x, lambda x: x)
     for i, entry in enumerate(trace):
         r1 = asyncio.run(graph.resume(trace,    entry.step_id))
         r2 = asyncio.run(graph.resume(restored, entry.step_id))
@@ -173,10 +162,6 @@ def test_resume_after_load_matches(graph):
             assert e1.output       == e2.output
             assert e1.successor_id == e2.successor_id
 
-
-# ---------------------------------------------------------------------------
-# Construction validation
-# ---------------------------------------------------------------------------
 
 @st.composite
 def dangling_successor_strategy(draw):
@@ -224,10 +209,6 @@ def test_type_mismatch_uncovered_output_raises(in_0, extra, in_1, out_1):
     with pytest.raises(AssertionError, match="not handled by any successor"):
         Graph(nodes=nodes, topology=topology, initial=0, id_factory=itertools.count().__next__)
 
-
-# ---------------------------------------------------------------------------
-# on_error
-# ---------------------------------------------------------------------------
 
 @given(graph_components_strategy())
 def test_sink_local_construction(components):
@@ -283,9 +264,9 @@ def test_sink_global_routes_error(in_t, out_t):
 
 @given(st.sampled_from(MSG_POOL), st.sampled_from(MSG_POOL))
 def test_explicit_handler_routes_error(in_t, out_t):
-    class ErrorHandler(mk_node(NodeError, NodeError)):  # type: ignore[misc]
-        async def run(self, input: NodeError) -> NodeError:
-            return input
+    class ErrorHandler(AbstractNode[NodeError, NodeError]):
+        async def run(self, input: NodeError) -> tuple[NodeError, Metadata]:
+            return input, Metadata()
 
     nodes    = {0: make_raising_node(in_t, {out_t}), 1: make_node(out_t, {out_t}), 'handler': ErrorHandler()}
     topology = {0: [1], 1: [], 'handler': []}
@@ -298,18 +279,14 @@ def test_explicit_handler_routes_error(in_t, out_t):
     assert trace[-1].output.exception_type == 'RuntimeError'
 
 
-# ---------------------------------------------------------------------------
-# Async
-# ---------------------------------------------------------------------------
-
 def test_concurrent_executions_interleave():
     """Two graph executions running concurrently should take ~1× node latency, not ~2×."""
     DELAY = 0.05
 
-    class SlowNode(mk_node(M0, M0)):  # type: ignore[misc]
-        async def run(self, input: M0) -> M0:
+    class SlowNode(AbstractNode[M0, M0]):
+        async def run(self, input: M0) -> tuple[M0, Metadata]:
             await asyncio.sleep(DELAY)
-            return M0()
+            return M0(), Metadata()
 
     graph = Graph(
         nodes      = {0: SlowNode()},

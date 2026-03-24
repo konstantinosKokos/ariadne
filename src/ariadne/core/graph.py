@@ -1,50 +1,77 @@
 from __future__ import annotations
 
+import time
 import traceback as tb
 from typing import Callable, Literal
 
 from pydantic import BaseModel
 
-from .error import NodeError
-from .node import AbstractNode, mk_node
+from .error import NodeError, VisitLimitExceeded, StepLimitExceeded
+from .metadata import Metadata
+from .node import AbstractNode
 from .trace import Trace, TraceEntry
 
-
-# ---------------------------------------------------------------------------
-# Error routing
-# ---------------------------------------------------------------------------
 
 class Error[NodeId](BaseModel, frozen=True):
     node_id: NodeId
 
 
-class ErrorSink(mk_node(NodeError, NodeError)):  # type: ignore[misc]
-    async def run(self, input: NodeError) -> NodeError:
-        return input
+class ErrorSink(AbstractNode[NodeError, NodeError]):
+    async def run(self, input: NodeError) -> tuple[NodeError, Metadata]:
+        return input, Metadata()
+
+
+type LimitBreached = VisitLimitExceeded | StepLimitExceeded
+
+
+class Limit[NodeId](BaseModel, frozen=True):
+    node_id: NodeId
+
+
+class LimitSink(AbstractNode[LimitBreached, LimitBreached]):
+    async def run(self, input: LimitBreached) -> tuple[LimitBreached, Metadata]:
+        return input, Metadata()
+
+
+def with_sinks[NodeId, SinkKey](
+    nodes:     dict[NodeId, AbstractNode],
+    topology:  dict[NodeId, list[NodeId]],
+    key_for:   Callable[[NodeId], SinkKey],
+    make_sink: Callable[[], AbstractNode],
+) -> tuple[dict[NodeId | SinkKey, AbstractNode], dict[NodeId | SinkKey, list[NodeId | SinkKey]]]:
+    sink_keys     = {name: key_for(name) for name in nodes}
+    unique_sinks  = {key: make_sink() for key in dict.fromkeys(sink_keys.values())}
+    sink_topology = {key: [] for key in unique_sinks}
+    augmented     = {name: succs + [sink_keys[name]] for name, succs in topology.items()}
+    return {**nodes, **unique_sinks}, {**augmented, **sink_topology}
 
 
 def with_local_sinks[NodeId](
     nodes:    dict[NodeId, AbstractNode],
     topology: dict[NodeId, list[NodeId]],
-) -> tuple[dict, dict]:
-    error_nodes    = {Error(node_id=name): ErrorSink() for name in nodes}
-    error_topology: dict[Error[NodeId], list[Error[NodeId]]] = {Error(node_id=name): [] for name in nodes}
-    augmented      = {name: succs + [Error(node_id=name)] for name, succs in topology.items()}
-    return {**nodes, **error_nodes}, {**augmented, **error_topology}
+) -> tuple[dict[NodeId | Error, AbstractNode], dict[NodeId | Error, list[NodeId | Error]]]:
+    return with_sinks(nodes, topology, lambda name: Error(node_id=name), ErrorSink)
 
 
 def with_global_sink[NodeId](
     nodes:    dict[NodeId, AbstractNode],
     topology: dict[NodeId, list[NodeId]],
-) -> tuple[dict, dict]:
-    key       = Error(node_id=None)
-    augmented = {name: succs + [key] for name, succs in topology.items()}
-    return {**nodes, key: ErrorSink()}, {**augmented, key: []}
+) -> tuple[dict[NodeId | Error, AbstractNode], dict[NodeId | Error, list[NodeId | Error]]]:
+    return with_sinks(nodes, topology, lambda _: Error(node_id=None), ErrorSink)
 
 
-# ---------------------------------------------------------------------------
-# Pure functions
-# ---------------------------------------------------------------------------
+def with_local_limit_sinks[NodeId](
+    nodes:    dict[NodeId, AbstractNode],
+    topology: dict[NodeId, list[NodeId]],
+) -> tuple[dict[NodeId | Limit, AbstractNode], dict[NodeId | Limit, list[NodeId | Limit]]]:
+    return with_sinks(nodes, topology, lambda name: Limit(node_id=name), LimitSink)
+
+
+def with_global_limit_sink[NodeId](
+    nodes:    dict[NodeId, AbstractNode],
+    topology: dict[NodeId, list[NodeId]],
+) -> tuple[dict[NodeId | Limit, AbstractNode], dict[NodeId | Limit, list[NodeId | Limit]]]:
+    return with_sinks(nodes, topology, lambda _: Limit(node_id=None), LimitSink)
 
 
 def assert_initial_present[NodeId](topology: dict[NodeId, list[NodeId]], initial: NodeId) -> None:
@@ -82,7 +109,7 @@ def assert_type_alignment[NodeId](
         (
             (name, t)
             for name, succs in non_sinks
-            for t in {nodes[s].in_type for s in succs} - nodes[name].out_type
+            for t in {nodes[s].in_type for s in succs} - nodes[name].out_types
         ),
         (None, None),
     )
@@ -92,7 +119,7 @@ def assert_type_alignment[NodeId](
         (
             (name, t)
             for name, succs in non_sinks
-            for t in nodes[name].out_type - {nodes[s].in_type for s in succs}
+            for t in nodes[name].out_types - {nodes[s].in_type for s in succs}
         ),
         (None, None),
     )
@@ -119,18 +146,51 @@ async def run_from[StepId, NodeId](
     id_factory: Callable[[], StepId],
     name:       NodeId,
     input:      BaseModel,
+    max_visits: int | dict[NodeId, int] | None = None,
+    max_steps:  int | None = None,
+    acyclic:    bool = False,
 ) -> Trace[StepId, NodeId]:
-    trace: list[TraceEntry[StepId, NodeId]] = []
+    trace:        list[TraceEntry[StepId, NodeId]] = []
     current_name  = name
     current_input = input
+    visit_counts: dict[NodeId, int] = {}
+    seen_states:  set = set()
+    step_count    = 0
 
     while True:
-        try:
-            output = await nodes[current_name].run(current_input)
-        except Exception as e:
-            if not any(nodes[s].in_type is NodeError for s in topology[current_name]):
-                raise
-            output = NodeError(exception_type=type(e).__name__, message=str(e), traceback=tb.format_exc())
+        if acyclic:
+            state = (current_name, current_input)
+            assert state not in seen_states, \
+                f"Cycle detected: ({current_name!r}, ...) already visited"
+            seen_states.add(state)
+
+        node_limit = max_visits if isinstance(max_visits, int) else (max_visits or {}).get(current_name)
+        visits     = visit_counts.get(current_name, 0)
+
+        if node_limit is not None and visits >= node_limit:
+            output   = VisitLimitExceeded()
+            if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
+                raise RuntimeError(f"Visit limit of {node_limit} exceeded for {current_name!r}")
+            metadata = Metadata()
+        elif max_steps is not None and step_count >= max_steps:
+            output   = StepLimitExceeded()
+            if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
+                raise RuntimeError(f"Step limit of {max_steps} exceeded")
+            metadata = Metadata()
+        else:
+            visit_counts[current_name] = visits + 1
+            step_count += 1
+            t0 = time.monotonic()
+            try:
+                output, metadata = await nodes[current_name].run(current_input)
+                duration_ms = (time.monotonic() - t0) * 1000
+            except Exception as e:
+                if not any(nodes[s].in_type is NodeError for s in topology[current_name]):
+                    raise
+                duration_ms = (time.monotonic() - t0) * 1000
+                output      = NodeError(exception_type=type(e).__name__, message=str(e), traceback=tb.format_exc())
+                metadata    = Metadata()
+            metadata = metadata.model_copy(update={'duration_ms': duration_ms})
 
         successor = dispatch(nodes, topology, current_name, output)
         trace.append(TraceEntry(
@@ -139,11 +199,11 @@ async def run_from[StepId, NodeId](
             input        = current_input,
             output       = output,
             successor_id = successor,
+            metadata     = metadata,
         ))
         if successor is None:
             break
-        current_name  = successor
-        current_input = output
+        current_name, current_input  = successor, output
 
     return trace
 
@@ -154,19 +214,17 @@ async def resume[StepId, NodeId](
     id_factory: Callable[[], StepId],
     trace:      Trace[StepId, NodeId],
     step_id:    StepId,
+    max_visits: int | dict[NodeId, int] | None = None,
+    max_steps:  int | None = None,
+    acyclic:    bool = False,
 ) -> Trace[StepId, NodeId]:
     idx = next((i for i, e in enumerate(trace) if e.step_id == step_id), None)
     assert idx is not None, f"step_id {step_id!r} not found in trace"
-
     prefix = trace[:idx]
     entry  = trace[idx]
+    return prefix + await run_from(nodes, topology, id_factory, entry.node_id, entry.input,
+                                   max_visits=max_visits, max_steps=max_steps, acyclic=acyclic)
 
-    return prefix + await run_from(nodes, topology, id_factory, entry.node_id, entry.input)
-
-
-# ---------------------------------------------------------------------------
-# Graph
-# ---------------------------------------------------------------------------
 
 class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
     """
@@ -189,6 +247,10 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
         initial:    NodeId,
         id_factory: Callable[[], StepId],
         on_error:   Literal['raise', 'sink-local', 'sink-global'] | NodeId = 'raise',
+        max_visits: int | dict[NodeId, int] | None = None,
+        max_steps:  int | None = None,
+        on_limit:   Literal['raise', 'sink-local', 'sink-global'] | NodeId = 'raise',
+        acyclic:    bool = False,
     ) -> None:
         assert_initial_present(topology, initial)
         assert_no_dangling_successors(topology)
@@ -207,7 +269,25 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
                     case None:
                         raise ValueError(f"{on_error!r} is not a node identifier")
                     case AbstractNode() as node:
-                        assert node.in_type is NodeError,  f"Error handler {node!r} must accept NodeError as input"
+                        assert node.in_type is NodeError, f"Error handler {node!r} must accept NodeError as input"
+                        topology = {n: [*sucs, node_id] if sucs and n != node_id else sucs for n, sucs in topology.items()}
+                    case _:
+                        raise ValueError(f"{node_id!r} is not a valid node implementation")
+
+        match on_limit:
+            case 'sink-local':
+                nodes, topology = with_local_limit_sinks(nodes, topology)
+            case 'sink-global':
+                nodes, topology = with_global_limit_sink(nodes, topology)
+            case 'raise':
+                pass
+            case node_id:
+                match nodes.get(node_id, None):
+                    case None:
+                        raise ValueError(f"{on_limit!r} is not a node identifier")
+                    case AbstractNode() as node:
+                        assert isinstance(VisitLimitExceeded(), node.in_type), \
+                            f"Limit handler {node_id!r} must accept VisitLimitExceeded and StepLimitExceeded"
                         topology = {n: [*sucs, node_id] if sucs and n != node_id else sucs for n, sucs in topology.items()}
                     case _:
                         raise ValueError(f"{node_id!r} is not a valid node implementation")
@@ -216,18 +296,25 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
         self.topology   = topology
         self.initial    = initial
         self.id_factory = id_factory
+        self.max_visits = max_visits
+        self.max_steps  = max_steps
+        self.acyclic    = acyclic
 
-        self.in_type  = nodes[initial].in_type
-        sinks         = [name for name, succs in topology.items() if not succs]
-        self.out_type = frozenset(t for s in sinks for t in nodes[s].out_type)
+        self.in_type   = nodes[initial].in_type
+        sinks          = [name for name, succs in topology.items() if not succs]
+        self.out_types = frozenset(t for s in sinks for t in nodes[s].out_types)
 
-    async def run(self, input: I) -> BaseModel:
+    async def run(self, input: I) -> tuple[BaseModel, Metadata]:
         """Node interface — used when this Graph is nested inside another."""
-        return (await run_from(self.nodes, self.topology, self.id_factory, self.initial, input))[-1].output
+        last = (await run_from(self.nodes, self.topology, self.id_factory, self.initial, input,
+                               max_visits=self.max_visits, max_steps=self.max_steps, acyclic=self.acyclic))[-1]
+        return last.output, last.metadata
 
     async def execute(self, input: I) -> Trace[StepId, NodeId]:
         """Top-level execution — returns the full trace."""
-        return await run_from(self.nodes, self.topology, self.id_factory, self.initial, input)
+        return await run_from(self.nodes, self.topology, self.id_factory, self.initial, input,
+                              max_visits=self.max_visits, max_steps=self.max_steps, acyclic=self.acyclic)
 
     async def resume(self, trace: Trace[StepId, NodeId], step_id: StepId) -> Trace[StepId, NodeId]:
-        return await resume(self.nodes, self.topology, self.id_factory, trace, step_id)
+        return await resume(self.nodes, self.topology, self.id_factory, trace, step_id,
+                            max_visits=self.max_visits, max_steps=self.max_steps, acyclic=self.acyclic)
