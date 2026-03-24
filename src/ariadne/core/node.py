@@ -1,41 +1,45 @@
+import types
+import typing
 from abc import ABC, abstractmethod
+from typing import Union, cast, get_args, get_origin
+
 from pydantic import BaseModel
 
+from .metadata import Metadata
 
-type Message = type[BaseModel]
+
+def _out_types(t) -> frozenset[type[BaseModel]]:
+    if isinstance(t, typing.TypeAliasType):
+        t = t.__value__
+    if isinstance(t, types.UnionType) or get_origin(t) is Union:
+        return frozenset(get_args(t))
+    return frozenset({cast(type[BaseModel], t)})
 
 
 class AbstractNode[Input: BaseModel, Output: BaseModel](ABC):
-    in_type:  type[Input]
-    out_type: frozenset[Message]
+    """
+    Base class for all nodes in a typed state transition graph.
+
+        class MyNode(AbstractNode[MyInput, MyOutput]):
+            async def run(self, input: MyInput) -> tuple[MyOutput, Metadata]: ...
+
+        class MyNode(AbstractNode[MyInput, OutputA | OutputB]):
+            async def run(self, input: MyInput) -> tuple[OutputA | OutputB, Metadata]: ...
+
+    in_type and out_types are derived automatically from the type parameters.
+    """
+
+    in_type:   type[BaseModel]
+    out_types: frozenset[type[BaseModel]]
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        base = next((b for b in getattr(cls, '__orig_bases__', ()) if get_origin(b) is AbstractNode), None)
+        if base is None:
+            return
+        in_t, out_t   = get_args(base)
+        cls.in_type   = cast(type[BaseModel], in_t)
+        cls.out_types = _out_types(out_t)
 
     @abstractmethod
-    async def run(self, input: Input) -> Output: ...
-
-
-def mk_node[In: BaseModel, Out: BaseModel](
-    input_type:  type[In],
-    output_type: type[Out] | set[type[Out]],
-) -> type[AbstractNode[In, Out]]:
-    """
-    Return a base class for a node with declared input type In and output type Out.
-
-        class MyNode(mk_node(MyInput, MyOutput)):
-            async def run(self, input: MyInput) -> MyOutput:
-                ...
-
-        class MyNode(mk_node(MyInput, {MyOutputA, MyOutputB})):
-            async def run(self, input: MyInput) -> MyOutputA | MyOutputB:
-                ...
-
-    The generated class carries In and Out as plain class attributes (in_type, out_type),
-    making them directly accessible without any runtime introspection.
-    """
-    class Node(AbstractNode[In, Out]):
-        in_type  = input_type
-        out_type = frozenset({output_type}) if isinstance(output_type, type) else frozenset(output_type)
-
-        @abstractmethod
-        async def run(self, input: In) -> Out: ...
-
-    return Node
+    async def run(self, input: Input) -> tuple[Output, Metadata]: ...
