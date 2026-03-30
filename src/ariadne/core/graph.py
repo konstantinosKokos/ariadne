@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import traceback as tb
-from typing import Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from pydantic import BaseModel
 
@@ -41,9 +41,12 @@ def with_sinks[NodeId, SinkKey](
 ) -> tuple[dict[NodeId | SinkKey, AbstractNode], dict[NodeId | SinkKey, list[NodeId | SinkKey]]]:
     sink_keys     = {name: key_for(name) for name in nodes}
     unique_sinks  = {key: make_sink() for key in dict.fromkeys(sink_keys.values())}
-    sink_topology = {key: [] for key in unique_sinks}
+    sink_topology: dict[SinkKey, list[NodeId | SinkKey]] = {key: [] for key in unique_sinks}
     augmented     = {name: succs + [sink_keys[name]] for name, succs in topology.items()}
-    return {**nodes, **unique_sinks}, {**augmented, **sink_topology}
+    return (
+        cast(dict[NodeId | SinkKey, AbstractNode], {**nodes, **unique_sinks}),
+        cast(dict[NodeId | SinkKey, list[NodeId | SinkKey]], {**augmented, **sink_topology}),
+    )
 
 
 def with_local_sinks[NodeId](
@@ -168,7 +171,7 @@ async def run_from[StepId, NodeId](
         visits     = visit_counts.get(current_name, 0)
 
         if node_limit is not None and visits >= node_limit:
-            output   = VisitLimitExceeded()
+            output: BaseModel = VisitLimitExceeded()
             if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
                 raise RuntimeError(f"Visit limit of {node_limit} exceeded for {current_name!r}")
             metadata = Metadata()
@@ -259,9 +262,9 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
 
         match on_error:
             case 'sink-local':
-                nodes, topology = with_local_sinks(nodes, topology)
+                nodes, topology = with_local_sinks(nodes, topology)  # type: ignore[assignment]
             case 'sink-global':
-                nodes, topology = with_global_sink(nodes, topology)
+                nodes, topology = with_global_sink(nodes, topology)  # type: ignore[assignment]
             case 'raise':
                 pass
             case node_id:
@@ -276,9 +279,9 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
 
         match on_limit:
             case 'sink-local':
-                nodes, topology = with_local_limit_sinks(nodes, topology)
+                nodes, topology = with_local_limit_sinks(nodes, topology)  # type: ignore[assignment]
             case 'sink-global':
-                nodes, topology = with_global_limit_sink(nodes, topology)
+                nodes, topology = with_global_limit_sink(nodes, topology)  # type: ignore[assignment]
             case 'raise':
                 pass
             case node_id:

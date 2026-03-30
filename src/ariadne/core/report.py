@@ -8,7 +8,7 @@ from .error import NodeError
 from .trace import Trace, TraceEntry
 
 
-def nullable_sum(a: float | None, b: float | None) -> float | None:
+def nullable_sum[N: (int, float)](a: N | None, b: N | None) -> N | None:
     match a, b:
         case (None, x) | (x, None): return x
         case _: return a + b
@@ -78,7 +78,7 @@ def by_node[StepId, NodeId](trace: Trace[StepId, NodeId]) -> dict[NodeId, Trace[
 def by_model[StepId, NodeId](trace: Trace[StepId, NodeId]) -> dict[str, Trace[StepId, NodeId]]:
     return {
         model: [e for e in trace if e.metadata.model == model]
-        for model in dict.fromkeys(e.metadata.model for e in trace)
+        for model in dict.fromkeys(e.metadata.model for e in trace if e.metadata.model is not None)
     }
 
 
