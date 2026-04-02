@@ -1,7 +1,8 @@
-"""Property-based tests over randomly generated DAG-shaped graphs."""
+"""Property-based tests for ariadne: graphs, resumption, and parallel map."""
 import asyncio
 import functools
 import itertools
+import json
 import time
 
 import pytest
@@ -9,7 +10,8 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
-from ariadne import Graph, AbstractNode, NodeError, Metadata, Error, dump_trace, load_trace
+from ariadne import Graph, AbstractNode, NodeError, Metadata, Error, MapNode, TraceEntry, dump_trace, load_trace, trace_list
+from ariadne.core.parallel import _reduce_metadata
 
 
 class M0(BaseModel, frozen=True): pass
@@ -304,3 +306,147 @@ def test_concurrent_executions_interleave():
 
     assert len(results) == 2
     assert elapsed < 1.5 * DELAY  # concurrent: ~DELAY; sequential would be ~2*DELAY
+
+
+# ---------------------------------------------------------------------------
+# MapNode and trace_list
+# ---------------------------------------------------------------------------
+
+class PA(BaseModel, frozen=True): value: int = 0
+class PB(BaseModel, frozen=True): value: int = 0
+
+
+class DoubleNode(AbstractNode[PA, PB]):
+    async def run(self, input: PA) -> tuple[PB, Metadata]:
+        return PB(value=input.value * 2), Metadata(tokens_input=1, tokens_output=1, cost_usd=0.001)
+
+
+def make_double_graph():
+    return Graph(
+        nodes      = {'double': DoubleNode()},
+        topology   = {'double': []},
+        initial    = 'double',
+        id_factory = itertools.count().__next__,
+    )
+
+
+pa_values = st.integers(min_value=0, max_value=100)
+
+
+@st.composite
+def pa_list(draw, min_size=0, max_size=8):
+    vals = draw(st.lists(pa_values, min_size=min_size, max_size=max_size))
+    return trace_list(PA)(items=[PA(value=v) for v in vals]), vals
+
+
+@st.composite
+def metadata_list(draw):
+    n = draw(st.integers(min_value=0, max_value=6))
+    return [
+        Metadata(
+            tokens_input  = draw(st.one_of(st.none(), st.integers(0, 100))),
+            tokens_output = draw(st.one_of(st.none(), st.integers(0, 100))),
+            cost_usd      = draw(st.one_of(st.none(), st.floats(0.0, 1.0, allow_nan=False))),
+            duration_ms   = draw(st.one_of(st.none(), st.floats(0.0, 1000.0, allow_nan=False))),
+            retries       = draw(st.integers(0, 5)),
+        )
+        for _ in range(n)
+    ]
+
+
+# trace_list singleton
+@given(st.sampled_from(MSG_POOL))
+def test_trace_list_singleton(t):
+    assert trace_list(t) is trace_list(t)
+
+
+# MapNode with plain inner node
+@given(pa_list())
+def test_map_node_plain_output_values(args):
+    inp, vals = args
+    mapper = MapNode(DoubleNode())
+    output, _ = asyncio.run(mapper.run(inp))
+    assert output.items == [PB(value=v * 2) for v in vals]  # type: ignore[attr-defined]
+
+
+@given(pa_list())
+def test_map_node_plain_no_sub_traces(args):
+    inp, _ = args
+    mapper = MapNode(DoubleNode())
+    asyncio.run(mapper.run(inp))
+    assert mapper.get_sub_traces() is None
+
+
+# MapNode with Graph inner node
+@given(pa_list(min_size=1))
+def test_map_node_graph_sub_traces_length(args):
+    inp, vals = args
+    mapper = MapNode(make_double_graph())
+    asyncio.run(mapper.run(inp))
+    assert len(mapper.get_sub_traces()) == len(vals)  # type: ignore[arg-type]
+
+
+@given(pa_list(min_size=1))
+def test_map_node_graph_sub_traces_end_at_sink(args):
+    inp, _ = args
+    mapper = MapNode(make_double_graph())
+    asyncio.run(mapper.run(inp))
+    for sub_trace in mapper.get_sub_traces():  # type: ignore[union-attr]
+        assert sub_trace[-1].successor_id is None
+
+
+@given(pa_list(min_size=1))
+def test_map_node_graph_sub_traces_outputs_match(args):
+    inp, vals = args
+    mapper = MapNode(make_double_graph())
+    output, _ = asyncio.run(mapper.run(inp))
+    for i, sub_trace in enumerate(mapper.get_sub_traces()):  # type: ignore[union-attr]
+        assert sub_trace[-1].output == output.items[i]  # type: ignore[attr-defined]
+
+
+# _reduce_metadata properties
+@given(metadata_list())
+def test_reduce_metadata_tokens_input_sum(metas):
+    result   = _reduce_metadata(metas)
+    nonnull  = [m.tokens_input for m in metas if m.tokens_input is not None]
+    expected = sum(nonnull) if nonnull else None
+    assert result.tokens_input == expected
+
+
+@given(metadata_list())
+def test_reduce_metadata_cost_sum(metas):
+    result   = _reduce_metadata(metas)
+    nonnull  = [m.cost_usd for m in metas if m.cost_usd is not None]
+    expected = sum(nonnull) if nonnull else None
+    assert (result.cost_usd is None) == (expected is None)
+    if expected is not None:
+        assert result.cost_usd == pytest.approx(expected)
+
+
+@given(metadata_list())
+def test_reduce_metadata_duration_max(metas):
+    result   = _reduce_metadata(metas)
+    nonnull  = [m.duration_ms for m in metas if m.duration_ms is not None]
+    expected = max(nonnull) if nonnull else None
+    assert result.duration_ms == expected
+
+
+@given(metadata_list())
+def test_reduce_metadata_retries_sum(metas):
+    assert _reduce_metadata(metas).retries == sum(m.retries for m in metas)
+
+
+# Serialization with sub_traces
+@given(pa_list(min_size=1))
+def test_dump_sub_traces_count_matches_input(args):
+    inp, vals = args
+    mapper = MapNode(make_double_graph())
+    outer  = Graph(
+        nodes      = {'map': mapper},
+        topology   = {'map': []},
+        initial    = 'map',
+        id_factory = itertools.count().__next__,
+    )
+    t   = asyncio.run(outer.execute(inp))
+    raw = json.loads(dump_trace(t, str, str))
+    assert len(raw[0]['sub_traces']) == len(vals)

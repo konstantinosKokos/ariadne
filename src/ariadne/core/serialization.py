@@ -20,17 +20,18 @@ def dump_trace[StepId, NodeId, A, B](
     serialize_step_id: Callable[[StepId], A],
     serialize_node_id: Callable[[NodeId], B],
 ) -> str:
-    return json.dumps([
-        {
+    def dump_entry(entry):
+        return {
             'step_id':      serialize_step_id(entry.step_id),
             'node_id':      serialize_node_id(entry.node_id),
             'input':        entry.input.model_dump(mode='json'),
             'output':       entry.output.model_dump(mode='json'),
             'successor_id': serialize_node_id(entry.successor_id) if entry.successor_id is not None else None,
             'metadata':     entry.metadata.model_dump(mode='json'),
+            'sub_traces':   [[dump_entry(e) for e in t] for t in entry.sub_traces]
+                            if entry.sub_traces is not None else None,
         }
-        for entry in trace
-    ])
+    return json.dumps([dump_entry(entry) for entry in trace])
 
 
 def load_trace[StepId, NodeId, A, B](

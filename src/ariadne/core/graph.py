@@ -169,6 +169,7 @@ async def run_from[StepId, NodeId](
 
         node_limit = max_visits if isinstance(max_visits, int) else (max_visits or {}).get(current_name)
         visits     = visit_counts.get(current_name, 0)
+        sub_traces = None
 
         if node_limit is not None and visits >= node_limit:
             output: BaseModel = VisitLimitExceeded()
@@ -187,12 +188,14 @@ async def run_from[StepId, NodeId](
             try:
                 output, metadata = await nodes[current_name].run(current_input)
                 duration_ms = (time.monotonic() - t0) * 1000
+                sub_traces  = nodes[current_name].get_sub_traces()
             except Exception as e:
                 if not any(nodes[s].in_type is NodeError for s in topology[current_name]):
                     raise
                 duration_ms = (time.monotonic() - t0) * 1000
                 output      = NodeError(exception_type=type(e).__name__, message=str(e), traceback=tb.format_exc())
                 metadata    = Metadata()
+                sub_traces  = None
             metadata = metadata.model_copy(update={'duration_ms': duration_ms})
 
         successor = dispatch(nodes, topology, current_name, output)
@@ -203,6 +206,7 @@ async def run_from[StepId, NodeId](
             output       = output,
             successor_id = successor,
             metadata     = metadata,
+            sub_traces   = sub_traces,
         ))
         if successor is None:
             break

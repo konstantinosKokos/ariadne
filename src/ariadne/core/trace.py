@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pydantic import BaseModel
 from typing import Optional as Maybe
 
@@ -16,6 +18,7 @@ class TraceEntry[StepId, NodeId]:
     output       : the output produced by the node
     successor_id : node_id of the successor that was chosen, or None if the node was a sink
     metadata     : execution metadata produced by the node and the framework
+    sub_traces   : for MapNode entries, one sub-trace per parallel item; None for all other nodes
     """
     step_id:      StepId
     node_id:      NodeId
@@ -23,6 +26,7 @@ class TraceEntry[StepId, NodeId]:
     output:       BaseModel
     successor_id: Maybe[NodeId]
     metadata:     Metadata
+    sub_traces:   Maybe[list[Trace]] = field(default=None, compare=False)
 
 
 type Trace[StepId, NodeId] = list[TraceEntry[StepId, NodeId]]
