@@ -493,6 +493,24 @@ def test_map_node_graph_metadata_sums_all_steps(k):
     assert meta.tokens_input == 30 * k                  # (10 + 20) per item
 
 
+# load_trace reconstructs the sub_traces that dump_trace wrote
+@given(pa_list(min_size=1))
+def test_load_reconstructs_sub_traces(args):
+    inp, vals = args
+    mapper = MapNode(make_double_graph())
+    outer  = Graph(
+        nodes      = {'map': mapper},
+        topology   = {'map': []},
+        initial    = 'map',
+        id_factory = itertools.count().__next__,
+    )
+    t            = asyncio.run(outer.execute(inp))
+    restored, _  = load_trace(dump_trace(t, lambda x: x, lambda x: x), outer, lambda x: x, lambda x: x)
+    assert restored[0].sub_traces is not None
+    assert len(restored[0].sub_traces) == len(vals)
+    assert [st[-1].output for st in restored[0].sub_traces] == [st[-1].output for st in t[0].sub_traces]
+
+
 # Serialization with sub_traces
 @given(pa_list(min_size=1))
 def test_dump_sub_traces_count_matches_input(args):
