@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 from pydantic import BaseModel, create_model
 
 from .metadata import Metadata
@@ -34,22 +35,11 @@ def _sum_or_none[A: (int, float)](*vals: A | None) -> A | None:
     return sum(nums) if nums else None  # type: ignore[return-value]
 
 
-def _reduce_metadata(metadatas: list[Metadata]) -> Metadata:
-    """
-    Fold a list of Metadata records into one.
-
-    Numeric fields (tokens, cost, retries) are summed.
-    duration_ms takes the max (wall-clock time of the parallel batch).
-    Categorical fields (model, finish_reason) are set to None.
-    tools_used is the concatenation of all per-item tuples.
-    """
+def _fold_metadata(metadatas: list[Metadata], duration: Callable[..., float | None]) -> Metadata:
     if not metadatas:
         return Metadata()
     return Metadata(
-        duration_ms              = max(
-                                       (m.duration_ms for m in metadatas if m.duration_ms is not None),
-                                       default=None,
-                                   ),
+        duration_ms              = duration(*(m.duration_ms for m in metadatas)),
         model                    = None,
         tokens_input             = _sum_or_none(*(m.tokens_input             for m in metadatas)),
         tokens_input_cached      = _sum_or_none(*(m.tokens_input_cached      for m in metadatas)),
@@ -60,6 +50,32 @@ def _reduce_metadata(metadatas: list[Metadata]) -> Metadata:
         tools_used               = tuple(t for m in metadatas for t in m.tools_used),
         retries                  = sum(m.retries for m in metadatas),
     )
+
+
+def _max_or_none(*vals: float | None) -> float | None:
+    return max((v for v in vals if v is not None), default=None)
+
+
+def _reduce_metadata(metadatas: list[Metadata]) -> Metadata:
+    """
+    Fold metadata across the parallel batch into one record.
+
+    Numeric fields (tokens, cost, retries) are summed.
+    duration_ms takes the max (wall-clock time of the parallel batch).
+    Categorical fields (model, finish_reason) are set to None.
+    tools_used is the concatenation of all per-item tuples.
+    """
+    return _fold_metadata(metadatas, _max_or_none)
+
+
+def _total_metadata(metadatas: list[Metadata]) -> Metadata:
+    """
+    Fold metadata along a single sequential trace into one record.
+
+    Identical to _reduce_metadata except duration_ms is summed: the steps of one
+    item run in sequence, so its wall-clock time is the sum of its steps'.
+    """
+    return _fold_metadata(metadatas, _sum_or_none)
 
 
 # ── MapNode ────────────────────────────────────────────────────────────────
@@ -98,8 +114,8 @@ class MapNode(AbstractNode):
 
         if isinstance(self.inner, Graph):
             traces    = await asyncio.gather(*(self.inner.execute(item) for item in items))
-            outputs   = [t[-1].output   for t in traces]
-            metadatas = [t[-1].metadata for t in traces]
+            outputs   = [t[-1].output for t in traces]
+            metadatas = [_total_metadata([e.metadata for e in t]) for t in traces]
             self._sub_traces = list(traces)
         else:
             pairs     = await asyncio.gather(*(self.inner.run(item) for item in items))

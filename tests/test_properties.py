@@ -459,6 +459,40 @@ def test_reduce_metadata_retries_sum(metas):
     assert _reduce_metadata(metas).retries == sum(m.retries for m in metas)
 
 
+# MapNode over a multi-step inner graph aggregates the whole sub-trace's metadata
+class IA(BaseModel, frozen=True): pass
+class IB(BaseModel, frozen=True): pass
+class IC(BaseModel, frozen=True): pass
+
+
+class Step1(AbstractNode[IA, IB]):
+    async def run(self, input: IA) -> tuple[IB, Metadata]:
+        return IB(), Metadata(cost_usd=1.0, tokens_input=10)
+
+
+class Step2(AbstractNode[IB, IC]):
+    async def run(self, input: IB) -> tuple[IC, Metadata]:
+        return IC(), Metadata(cost_usd=2.0, tokens_input=20)
+
+
+def make_two_step_graph():
+    return Graph(
+        nodes      = {0: Step1(), 1: Step2()},
+        topology   = {0: [1], 1: []},
+        initial    = 0,
+        id_factory = itertools.count().__next__,
+    )
+
+
+@given(st.integers(min_value=1, max_value=6))
+def test_map_node_graph_metadata_sums_all_steps(k):
+    mapper    = MapNode(make_two_step_graph())
+    inp       = trace_list(IA)(items=[IA() for _ in range(k)])
+    _, meta   = asyncio.run(mapper.run(inp))
+    assert meta.cost_usd     == pytest.approx(3.0 * k)  # (1.0 + 2.0) per item
+    assert meta.tokens_input == 30 * k                  # (10 + 20) per item
+
+
 # Serialization with sub_traces
 @given(pa_list(min_size=1))
 def test_dump_sub_traces_count_matches_input(args):
