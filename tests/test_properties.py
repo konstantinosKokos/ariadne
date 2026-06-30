@@ -226,6 +226,29 @@ def test_sink_global_construction(components):
           id_factory=itertools.count().__next__, on_error='sink-global')
 
 
+@given(graph_components_strategy())
+def test_sink_local_normal_termination(components):
+    """With sink-local wiring, an error-free run still terminates at a real sink."""
+    nodes, topology = components
+    graph = Graph(nodes=nodes, topology=topology, initial=0,
+                  id_factory=itertools.count().__next__, on_error='sink-local')
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
+    assert trace[-1].successor_id is None
+    assert not isinstance(trace[-1].node_id, Error)
+    assert not any(isinstance(e.output, NodeError) for e in trace)
+
+
+@given(graph_components_strategy())
+def test_sink_global_normal_termination(components):
+    nodes, topology = components
+    graph = Graph(nodes=nodes, topology=topology, initial=0,
+                  id_factory=itertools.count().__next__, on_error='sink-global')
+    trace = asyncio.run(graph.execute(graph.nodes[0].in_type()))
+    assert trace[-1].successor_id is None
+    assert not isinstance(trace[-1].node_id, Error)
+    assert not any(isinstance(e.output, NodeError) for e in trace)
+
+
 @given(st.sampled_from(MSG_POOL), st.sampled_from(MSG_POOL))
 def test_on_error_raise_propagates(in_t, out_t):
     nodes    = {0: make_raising_node(in_t, {out_t}), 1: make_node(out_t, {out_t})}

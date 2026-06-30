@@ -39,10 +39,10 @@ def with_sinks[NodeId, SinkKey](
     key_for:   Callable[[NodeId], SinkKey],
     make_sink: Callable[[], AbstractNode],
 ) -> tuple[dict[NodeId | SinkKey, AbstractNode], dict[NodeId | SinkKey, list[NodeId | SinkKey]]]:
-    sink_keys     = {name: key_for(name) for name in nodes}
+    sink_keys     = {name: key_for(name) for name, succs in topology.items() if succs}
     unique_sinks  = {key: make_sink() for key in dict.fromkeys(sink_keys.values())}
     sink_topology: dict[SinkKey, list[NodeId | SinkKey]] = {key: [] for key in unique_sinks}
-    augmented     = {name: succs + [sink_keys[name]] for name, succs in topology.items()}
+    augmented     = {name: succs + [sink_keys[name]] if succs else succs for name, succs in topology.items()}
     return (
         cast(dict[NodeId | SinkKey, AbstractNode], {**nodes, **unique_sinks}),
         cast(dict[NodeId | SinkKey, list[NodeId | SinkKey]], {**augmented, **sink_topology}),
