@@ -67,24 +67,20 @@ def make_node(in_type, out_types_set):
 def graph_components_strategy(draw):
     """Returns (nodes, topology) without constructing Graph — lets tests vary on_error."""
     n        = draw(st.integers(min_value=2, max_value=7))
-    topology = {i: [] for i in range(n)}
-
-    for j in range(1, n):
-        topology[draw(st.integers(min_value=0, max_value=j - 1))].append(j)
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if j not in topology[i] and draw(st.booleans()):
-                topology[i].append(j)
-
     in_types = {i: draw(st.sampled_from(MSG_POOL)) for i in range(n)}
+    topology = {i: [i + 1] if i + 1 < n else [] for i in range(n)}
 
-    nodes = {}
     for i in range(n):
-        succs        = topology[i]
-        out_types_set = {in_types[j] for j in succs} if succs else {in_types[i]}
-        nodes[i]     = make_node(in_types[i], out_types_set)
+        used = {in_types[j] for j in topology[i]}
+        for j in range(i + 2, n):
+            if in_types[j] not in used and draw(st.booleans()):
+                topology[i].append(j)
+                used.add(in_types[j])
 
+    nodes = {
+        i: make_node(in_types[i], {in_types[j] for j in succs} if (succs := topology[i]) else {in_types[i]})
+        for i in range(n)
+    }
     return nodes, topology
 
 
@@ -209,6 +205,14 @@ def test_type_mismatch_uncovered_output_raises(in_0, extra, in_1, out_1):
     nodes    = {0: make_node(in_0, {in_1, extra}), 1: make_node(in_1, {out_1})}
     topology = {0: [1], 1: []}
     with pytest.raises(AssertionError, match="not handled by any successor"):
+        Graph(nodes=nodes, topology=topology, initial=0, id_factory=itertools.count().__next__)
+
+
+@given(st.sampled_from(MSG_POOL), st.sampled_from(MSG_POOL))
+def test_ambiguous_successor_types_raise(in_t, shared):
+    nodes    = {0: make_node(in_t, {shared}), 1: make_node(shared, {shared}), 2: make_node(shared, {shared})}
+    topology = {0: [1, 2], 1: [], 2: []}
+    with pytest.raises(AssertionError, match="share an input type"):
         Graph(nodes=nodes, topology=topology, initial=0, id_factory=itertools.count().__next__)
 
 

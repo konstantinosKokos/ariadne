@@ -127,6 +127,17 @@ def assert_type_alignment[NodeId](
     assert name is None and t is None, f"Node {name!r}: output type {t} is not handled by any successor"
 
 
+def assert_unique_successor_types[NodeId](
+    nodes:    dict[NodeId, AbstractNode],
+    topology: dict[NodeId, list[NodeId]],
+) -> None:
+    ambiguous = next(
+        (name for name, succs in topology.items() if len({nodes[s].in_type for s in succs}) != len(succs)),
+        None,
+    )
+    assert ambiguous is None, f"Node {ambiguous!r}: multiple successors share an input type"
+
+
 def dispatch[NodeId](
     nodes:    dict[NodeId, AbstractNode],
     topology: dict[NodeId, list[NodeId]],
@@ -269,6 +280,7 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
         assert_no_dangling_successors(topology)
         assert_nodes_topology_consistent(nodes, topology)
         assert_type_alignment(nodes, topology)
+        assert_unique_successor_types(nodes, topology)
 
         match on_error:
             case 'sink-local':
