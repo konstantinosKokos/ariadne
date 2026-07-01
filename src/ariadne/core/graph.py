@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal, cast
 from pydantic import BaseModel
 
 from .error import NodeError, LimitExceeded
-from .metadata import Metadata
+from .metadata import Metadata, _total_metadata
 from .node import AbstractNode
 from .trace import Trace, TraceEntry
 
@@ -331,9 +331,13 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
 
     async def run(self, input: I) -> tuple[BaseModel, Metadata]:
         """Node interface — used when this Graph is nested inside another."""
-        last = (await run_from(self.nodes, self.topology, self.id_factory, self.initial, input,
-                               max_visits=self.max_visits, max_steps=self.max_steps, acyclic=self.acyclic))[-1]
-        return last.output, last.metadata
+        trace = await run_from(
+            self.nodes, self.topology, self.id_factory, self.initial, input,
+            max_visits = self.max_visits,
+            max_steps  = self.max_steps,
+            acyclic    = self.acyclic,
+        )
+        return trace[-1].output, _total_metadata([e.metadata for e in trace])
 
     async def execute(self, input: I) -> Trace[StepId, NodeId]:
         """Top-level execution — returns the full trace."""

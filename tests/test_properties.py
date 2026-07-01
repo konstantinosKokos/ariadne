@@ -11,7 +11,7 @@ from hypothesis import strategies as st
 from pydantic import BaseModel
 
 from ariadne import Graph, AbstractNode, NodeError, LimitExceeded, Metadata, Error, Limit, MapNode, TraceEntry, dump_trace, load_trace, trace_list
-from ariadne.core.parallel import _reduce_metadata
+from ariadne.core.metadata import _reduce_metadata
 
 
 class M0(BaseModel, frozen=True): pass
@@ -527,6 +527,14 @@ def test_map_node_graph_metadata_sums_all_steps(k):
     _, meta   = asyncio.run(mapper.run(inp))
     assert meta.cost_usd     == pytest.approx(3.0 * k)  # (1.0 + 2.0) per item
     assert meta.tokens_input == 30 * k                  # (10 + 20) per item
+
+
+def test_nested_graph_aggregates_metadata():
+    outer = Graph(nodes={'g': make_two_step_graph()}, topology={'g': []}, initial='g',
+                  id_factory=itertools.count().__next__)
+    trace = asyncio.run(outer.execute(IA()))
+    assert trace[-1].metadata.cost_usd     == pytest.approx(3.0)
+    assert trace[-1].metadata.tokens_input == 30
 
 
 # load_trace reconstructs the sub_traces that dump_trace wrote
