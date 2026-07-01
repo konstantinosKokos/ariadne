@@ -327,6 +327,15 @@ def test_on_limit_sink_global_routes_step_limit():
     assert trace[-1].output == LimitExceeded(kind='steps', limit=2)
 
 
+def test_resume_respects_global_step_limit():
+    graph = Graph(nodes={0: SelfLoop()}, topology={0: [0]}, initial=0,
+                  id_factory=itertools.count().__next__, max_steps=4, on_limit='sink-global')
+    trace   = asyncio.run(graph.execute(M0()))
+    resumed = asyncio.run(graph.resume(trace, trace[2].step_id))
+    assert len(resumed) == len(trace)
+    assert resumed[-1].output == LimitExceeded(kind='steps', limit=4)
+
+
 def test_concurrent_executions_interleave():
     """Two graph executions running concurrently should take ~1× node latency, not ~2×."""
     DELAY = 0.05

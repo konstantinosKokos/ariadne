@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import traceback as tb
+from collections import Counter
 from typing import Any, Callable, Literal, cast
 
 from pydantic import BaseModel
@@ -146,16 +147,17 @@ async def run_from[StepId, NodeId](
     id_factory: Callable[[], StepId],
     name:       NodeId,
     input:      BaseModel,
-    max_visits: int | dict[NodeId, int] | None = None,
-    max_steps:  int | None = None,
-    acyclic:    bool = False,
+    max_visits:   int | dict[NodeId, int] | None = None,
+    max_steps:    int | None = None,
+    acyclic:      bool = False,
+    visit_counts: dict[NodeId, int] | None = None,
+    step_count:   int = 0,
 ) -> Trace[StepId, NodeId]:
     trace:        list[TraceEntry[StepId, NodeId]] = []
     current_name  = name
     current_input = input
-    visit_counts: dict[NodeId, int] = {}
+    visit_counts  = visit_counts if visit_counts is not None else {}
     seen_states:  set = set()
-    step_count    = 0
 
     while True:
         if acyclic:
@@ -227,8 +229,14 @@ async def resume[StepId, NodeId](
     assert idx is not None, f"step_id {step_id!r} not found in trace"
     prefix = trace[:idx]
     entry  = trace[idx]
-    return prefix + await run_from(nodes, topology, id_factory, entry.node_id, entry.input,
-                                   max_visits=max_visits, max_steps=max_steps, acyclic=acyclic)
+    return prefix + await run_from(
+        nodes, topology, id_factory, entry.node_id, entry.input,
+        max_visits   = max_visits,
+        max_steps    = max_steps,
+        acyclic      = acyclic,
+        visit_counts = Counter(e.node_id for e in prefix),
+        step_count   = len(prefix),
+    )
 
 
 class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
