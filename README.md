@@ -141,7 +141,7 @@ Graph(
 )
 ```
 
-`VisitLimitExceeded` and `StepLimitExceeded` are routed identically to `NodeError`.
+`LimitExceeded` (with `kind` of `'visits'` or `'steps'`) is routed like `NodeError`.
 
 ---
 

@@ -10,7 +10,7 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
-from ariadne import Graph, AbstractNode, NodeError, Metadata, Error, MapNode, TraceEntry, dump_trace, load_trace, trace_list
+from ariadne import Graph, AbstractNode, NodeError, LimitExceeded, Metadata, Error, Limit, MapNode, TraceEntry, dump_trace, load_trace, trace_list
 from ariadne.core.parallel import _reduce_metadata
 
 
@@ -302,6 +302,29 @@ def test_explicit_handler_routes_error(in_t, out_t):
     assert trace[-1].node_id == 'handler'
     assert isinstance(trace[-1].output, NodeError)
     assert trace[-1].output.exception_type == 'RuntimeError'
+
+
+class SelfLoop(AbstractNode[M0, M0]):
+    async def run(self, input: M0) -> tuple[M0, Metadata]:
+        return M0(), Metadata()
+
+
+def test_on_limit_sink_local_routes_visit_limit():
+    graph = Graph(nodes={0: SelfLoop()}, topology={0: [0]}, initial=0,
+                  id_factory=itertools.count().__next__, max_visits=3, on_limit='sink-local')
+    trace = asyncio.run(graph.execute(M0()))
+    assert trace[-1].successor_id is None
+    assert trace[-1].node_id == Limit(node_id=0)
+    assert trace[-1].output == LimitExceeded(kind='visits', limit=3)
+
+
+def test_on_limit_sink_global_routes_step_limit():
+    graph = Graph(nodes={0: SelfLoop()}, topology={0: [0]}, initial=0,
+                  id_factory=itertools.count().__next__, max_steps=2, on_limit='sink-global')
+    trace = asyncio.run(graph.execute(M0()))
+    assert trace[-1].successor_id is None
+    assert trace[-1].node_id == Limit(node_id=None)
+    assert trace[-1].output == LimitExceeded(kind='steps', limit=2)
 
 
 def test_concurrent_executions_interleave():

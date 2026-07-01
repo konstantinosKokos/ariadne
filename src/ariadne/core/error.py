@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import BaseModel
 
 
@@ -7,5 +8,6 @@ class NodeError(BaseModel, frozen=True):
     traceback:      str
 
 
-class VisitLimitExceeded(BaseModel, frozen=True): pass
-class StepLimitExceeded(BaseModel, frozen=True):  pass
+class LimitExceeded(BaseModel, frozen=True):
+    kind:  Literal['visits', 'steps']
+    limit: int

@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal, cast
 
 from pydantic import BaseModel
 
-from .error import NodeError, VisitLimitExceeded, StepLimitExceeded
+from .error import NodeError, LimitExceeded
 from .metadata import Metadata
 from .node import AbstractNode
 from .trace import Trace, TraceEntry
@@ -21,15 +21,12 @@ class ErrorSink(AbstractNode[NodeError, NodeError]):
         return input, Metadata()
 
 
-type LimitBreached = VisitLimitExceeded | StepLimitExceeded
-
-
 class Limit[NodeId](BaseModel, frozen=True):
     node_id: NodeId
 
 
-class LimitSink(AbstractNode[LimitBreached, LimitBreached]):
-    async def run(self, input: LimitBreached) -> tuple[LimitBreached, Metadata]:
+class LimitSink(AbstractNode[LimitExceeded, LimitExceeded]):
+    async def run(self, input: LimitExceeded) -> tuple[LimitExceeded, Metadata]:
         return input, Metadata()
 
 
@@ -169,15 +166,16 @@ async def run_from[StepId, NodeId](
 
         node_limit = max_visits if isinstance(max_visits, int) else (max_visits or {}).get(current_name)
         visits     = visit_counts.get(current_name, 0)
+        breaching  = not isinstance(current_input, (NodeError, LimitExceeded))
         sub_traces = None
 
-        if node_limit is not None and visits >= node_limit:
-            output: BaseModel = VisitLimitExceeded()
+        if breaching and node_limit is not None and visits >= node_limit:
+            output: BaseModel = LimitExceeded(kind='visits', limit=node_limit)
             if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
                 raise RuntimeError(f"Visit limit of {node_limit} exceeded for {current_name!r}")
             metadata = Metadata()
-        elif max_steps is not None and step_count >= max_steps:
-            output   = StepLimitExceeded()
+        elif breaching and max_steps is not None and step_count >= max_steps:
+            output   = LimitExceeded(kind='steps', limit=max_steps)
             if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
                 raise RuntimeError(f"Step limit of {max_steps} exceeded")
             metadata = Metadata()
@@ -293,8 +291,8 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
                     case None:
                         raise ValueError(f"{on_limit!r} is not a node identifier")
                     case AbstractNode() as node:
-                        assert isinstance(VisitLimitExceeded(), node.in_type), \
-                            f"Limit handler {node_id!r} must accept VisitLimitExceeded and StepLimitExceeded"
+                        assert node.in_type is LimitExceeded, \
+                            f"Limit handler {node_id!r} must accept LimitExceeded as input"
                         topology = {n: [*sucs, node_id] if sucs and n != node_id else sucs for n, sucs in topology.items()}
                     case _:
                         raise ValueError(f"{node_id!r} is not a valid node implementation")
