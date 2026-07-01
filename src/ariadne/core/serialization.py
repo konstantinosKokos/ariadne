@@ -20,17 +20,18 @@ def dump_trace[StepId, NodeId, A, B](
     serialize_step_id: Callable[[StepId], A],
     serialize_node_id: Callable[[NodeId], B],
 ) -> str:
-    return json.dumps([
-        {
+    def dump_entry(entry):
+        return {
             'step_id':      serialize_step_id(entry.step_id),
             'node_id':      serialize_node_id(entry.node_id),
             'input':        entry.input.model_dump(mode='json'),
             'output':       entry.output.model_dump(mode='json'),
             'successor_id': serialize_node_id(entry.successor_id) if entry.successor_id is not None else None,
             'metadata':     entry.metadata.model_dump(mode='json'),
+            'sub_traces':   [[dump_entry(e) for e in t] for t in entry.sub_traces]
+                            if entry.sub_traces is not None else None,
         }
-        for entry in trace
-    ])
+    return json.dumps([dump_entry(entry) for entry in trace])
 
 
 def load_trace[StepId, NodeId, A, B](
@@ -43,25 +44,29 @@ def load_trace[StepId, NodeId, A, B](
     Returns the restored trace and the last step_id it contains.
     The caller should use the last step_id to advance their id_factory before resuming.
     """
-    def output_type(node_id: NodeId, successor_id: NodeId | None, raw_output: dict):
+    def output_type(g: Graph, node_id: NodeId, successor_id: NodeId | None, raw_output: dict):
         if successor_id is not None:
-            return graph.nodes[successor_id].in_type
+            return g.nodes[successor_id].in_type
         return next(
-            t for t in graph.nodes[node_id].out_types
+            t for t in g.nodes[node_id].out_types
             if validates(t, raw_output)
         )
 
-    trace = []
-    for raw in json.loads(data):
-        node_id      = deserialize_node_id(raw['node_id'])
-        successor_id = deserialize_node_id(raw['successor_id']) if raw['successor_id'] is not None else None
-        trace.append(TraceEntry(
-            step_id      = deserialize_step_id(raw['step_id']),
-            node_id      = node_id,
-            input        = graph.nodes[node_id].in_type.model_validate(raw['input']),
-            output       = output_type(node_id, successor_id, raw['output']).model_validate(raw['output']),
-            successor_id = successor_id,
-            metadata     = Metadata.model_validate(raw['metadata']),
-        ))
+    def load_entries(raws: list, g: Graph) -> Trace[StepId, NodeId]:
+        def to_entry(raw):
+            node_id      = deserialize_node_id(raw['node_id'])
+            successor_id = deserialize_node_id(raw['successor_id']) if raw['successor_id'] is not None else None
+            sub          = raw.get('sub_traces')
+            return TraceEntry(
+                step_id      = deserialize_step_id(raw['step_id']),
+                node_id      = node_id,
+                input        = g.nodes[node_id].in_type.model_validate(raw['input']),
+                output       = output_type(g, node_id, successor_id, raw['output']).model_validate(raw['output']),
+                successor_id = successor_id,
+                metadata     = Metadata.model_validate(raw['metadata']),
+                sub_traces   = [load_entries(t, getattr(g.nodes[node_id], 'inner')) for t in sub] if sub is not None else None,
+            )
+        return [to_entry(raw) for raw in raws]
 
+    trace = load_entries(json.loads(data), graph)
     return trace, trace[-1].step_id

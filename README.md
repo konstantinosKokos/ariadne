@@ -17,7 +17,7 @@ You probably shouldn't, especially if you like your packages with their bells an
 If you do decide to use it against your better judgement, remember: the primary use case for ariadne is to harness static LLM-based pipelines where correctness and auditability matter.
 Ariadne attempts to satisfy these demands with construction-time type safety, and a typed trace as a first-class execution artifact.
 
-You should *definitely* not use ariadne if you're expecting dynamic graph structure, or anything requiring parallel fan-out (a node dispatching to multiple successors simultaneously) or streaming; neither feature is supported or planned.
+You should *definitely* not use ariadne if you're expecting dynamic graph structure, fan-out (a node dispatching to multiple successors simultaneously), or streaming; none of these is supported or planned.
 
 ---
 
@@ -31,6 +31,7 @@ State is a pair `(node, input)` (*i.e.*, a continuation).
 There's no global state.
 
 Every execution produces a **trace**, *i.e.* a list of `TraceEntry` values recording, for each step: the node that ran, its input, its output, its successor, and a `Metadata` side-channel.
+`MapNode` steps are the exception: they also record the full sub-trace of every item mapped over (see `MapNode` below).
 The trace is the canonical and faithful record of a run.
 
 ---
@@ -110,6 +111,22 @@ output = trace[-1].output
 
 ---
 
+## Parallel map
+
+`MapNode` lifts a node over a homogeneous list, running one instance per item concurrently.
+
+```python
+from ariadne import MapNode, trace_list
+
+mapper = MapNode(inner)          # inner: AbstractNode[A, B]
+# mapper: AbstractNode[TraceList[A], TraceList[B]]
+```
+
+When `inner` is a `Graph`, each item's trace is kept in the enclosing step's `sub_traces`.
+Metadata is aggregated across items: tokens and cost summed, duration taken as the parallel max.
+
+---
+
 ## Error routing
 
 Unhandled exceptions in `run` are caught and wrapped in `NodeError(exception_type, message, traceback)`.
@@ -141,7 +158,7 @@ Graph(
 )
 ```
 
-`VisitLimitExceeded` and `StepLimitExceeded` are routed identically to `NodeError`.
+`LimitExceeded` (with `kind` of `'visits'` or `'steps'`) is routed like `NodeError`.
 
 ---
 

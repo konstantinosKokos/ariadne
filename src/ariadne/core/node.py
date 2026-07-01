@@ -6,6 +6,7 @@ from typing import Union, cast, get_args, get_origin
 from pydantic import BaseModel
 
 from .metadata import Metadata
+from .trace import Trace
 
 
 def _out_types(t) -> frozenset[type[BaseModel]]:
@@ -43,3 +44,6 @@ class AbstractNode[Input: BaseModel, Output: BaseModel](ABC):
 
     @abstractmethod
     async def run(self, input: Input) -> tuple[Output, Metadata]: ...
+
+    def get_sub_traces(self) -> list[Trace] | None:
+        return None

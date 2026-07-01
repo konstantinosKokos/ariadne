@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 import traceback as tb
+from collections import Counter
 from typing import Any, Callable, Literal, cast
 
 from pydantic import BaseModel
 
-from .error import NodeError, VisitLimitExceeded, StepLimitExceeded
-from .metadata import Metadata
+from .error import NodeError, LimitExceeded
+from .metadata import Metadata, _total_metadata
 from .node import AbstractNode
 from .trace import Trace, TraceEntry
 
@@ -21,15 +22,12 @@ class ErrorSink(AbstractNode[NodeError, NodeError]):
         return input, Metadata()
 
 
-type LimitBreached = VisitLimitExceeded | StepLimitExceeded
-
-
 class Limit[NodeId](BaseModel, frozen=True):
     node_id: NodeId
 
 
-class LimitSink(AbstractNode[LimitBreached, LimitBreached]):
-    async def run(self, input: LimitBreached) -> tuple[LimitBreached, Metadata]:
+class LimitSink(AbstractNode[LimitExceeded, LimitExceeded]):
+    async def run(self, input: LimitExceeded) -> tuple[LimitExceeded, Metadata]:
         return input, Metadata()
 
 
@@ -39,10 +37,10 @@ def with_sinks[NodeId, SinkKey](
     key_for:   Callable[[NodeId], SinkKey],
     make_sink: Callable[[], AbstractNode],
 ) -> tuple[dict[NodeId | SinkKey, AbstractNode], dict[NodeId | SinkKey, list[NodeId | SinkKey]]]:
-    sink_keys     = {name: key_for(name) for name in nodes}
+    sink_keys     = {name: key_for(name) for name, succs in topology.items() if succs}
     unique_sinks  = {key: make_sink() for key in dict.fromkeys(sink_keys.values())}
     sink_topology: dict[SinkKey, list[NodeId | SinkKey]] = {key: [] for key in unique_sinks}
-    augmented     = {name: succs + [sink_keys[name]] for name, succs in topology.items()}
+    augmented     = {name: succs + [sink_keys[name]] if succs else succs for name, succs in topology.items()}
     return (
         cast(dict[NodeId | SinkKey, AbstractNode], {**nodes, **unique_sinks}),
         cast(dict[NodeId | SinkKey, list[NodeId | SinkKey]], {**augmented, **sink_topology}),
@@ -129,6 +127,17 @@ def assert_type_alignment[NodeId](
     assert name is None and t is None, f"Node {name!r}: output type {t} is not handled by any successor"
 
 
+def assert_unique_successor_types[NodeId](
+    nodes:    dict[NodeId, AbstractNode],
+    topology: dict[NodeId, list[NodeId]],
+) -> None:
+    ambiguous = next(
+        (name for name, succs in topology.items() if len({nodes[s].in_type for s in succs}) != len(succs)),
+        None,
+    )
+    assert ambiguous is None, f"Node {ambiguous!r}: multiple successors share an input type"
+
+
 def dispatch[NodeId](
     nodes:    dict[NodeId, AbstractNode],
     topology: dict[NodeId, list[NodeId]],
@@ -149,16 +158,17 @@ async def run_from[StepId, NodeId](
     id_factory: Callable[[], StepId],
     name:       NodeId,
     input:      BaseModel,
-    max_visits: int | dict[NodeId, int] | None = None,
-    max_steps:  int | None = None,
-    acyclic:    bool = False,
+    max_visits:   int | dict[NodeId, int] | None = None,
+    max_steps:    int | None = None,
+    acyclic:      bool = False,
+    visit_counts: dict[NodeId, int] | None = None,
+    step_count:   int = 0,
 ) -> Trace[StepId, NodeId]:
     trace:        list[TraceEntry[StepId, NodeId]] = []
     current_name  = name
     current_input = input
-    visit_counts: dict[NodeId, int] = {}
+    visit_counts  = visit_counts if visit_counts is not None else {}
     seen_states:  set = set()
-    step_count    = 0
 
     while True:
         if acyclic:
@@ -169,14 +179,16 @@ async def run_from[StepId, NodeId](
 
         node_limit = max_visits if isinstance(max_visits, int) else (max_visits or {}).get(current_name)
         visits     = visit_counts.get(current_name, 0)
+        breaching  = not isinstance(current_input, (NodeError, LimitExceeded))
+        sub_traces = None
 
-        if node_limit is not None and visits >= node_limit:
-            output: BaseModel = VisitLimitExceeded()
+        if breaching and node_limit is not None and visits >= node_limit:
+            output: BaseModel = LimitExceeded(kind='visits', limit=node_limit)
             if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
                 raise RuntimeError(f"Visit limit of {node_limit} exceeded for {current_name!r}")
             metadata = Metadata()
-        elif max_steps is not None and step_count >= max_steps:
-            output   = StepLimitExceeded()
+        elif breaching and max_steps is not None and step_count >= max_steps:
+            output   = LimitExceeded(kind='steps', limit=max_steps)
             if not any(isinstance(output, nodes[s].in_type) for s in topology[current_name]):
                 raise RuntimeError(f"Step limit of {max_steps} exceeded")
             metadata = Metadata()
@@ -187,12 +199,14 @@ async def run_from[StepId, NodeId](
             try:
                 output, metadata = await nodes[current_name].run(current_input)
                 duration_ms = (time.monotonic() - t0) * 1000
+                sub_traces  = nodes[current_name].get_sub_traces()
             except Exception as e:
                 if not any(nodes[s].in_type is NodeError for s in topology[current_name]):
                     raise
                 duration_ms = (time.monotonic() - t0) * 1000
                 output      = NodeError(exception_type=type(e).__name__, message=str(e), traceback=tb.format_exc())
                 metadata    = Metadata()
+                sub_traces  = None
             metadata = metadata.model_copy(update={'duration_ms': duration_ms})
 
         successor = dispatch(nodes, topology, current_name, output)
@@ -203,6 +217,7 @@ async def run_from[StepId, NodeId](
             output       = output,
             successor_id = successor,
             metadata     = metadata,
+            sub_traces   = sub_traces,
         ))
         if successor is None:
             break
@@ -225,8 +240,14 @@ async def resume[StepId, NodeId](
     assert idx is not None, f"step_id {step_id!r} not found in trace"
     prefix = trace[:idx]
     entry  = trace[idx]
-    return prefix + await run_from(nodes, topology, id_factory, entry.node_id, entry.input,
-                                   max_visits=max_visits, max_steps=max_steps, acyclic=acyclic)
+    return prefix + await run_from(
+        nodes, topology, id_factory, entry.node_id, entry.input,
+        max_visits   = max_visits,
+        max_steps    = max_steps,
+        acyclic      = acyclic,
+        visit_counts = Counter(e.node_id for e in prefix),
+        step_count   = len(prefix),
+    )
 
 
 class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
@@ -259,6 +280,7 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
         assert_no_dangling_successors(topology)
         assert_nodes_topology_consistent(nodes, topology)
         assert_type_alignment(nodes, topology)
+        assert_unique_successor_types(nodes, topology)
 
         match on_error:
             case 'sink-local':
@@ -289,8 +311,8 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
                     case None:
                         raise ValueError(f"{on_limit!r} is not a node identifier")
                     case AbstractNode() as node:
-                        assert isinstance(VisitLimitExceeded(), node.in_type), \
-                            f"Limit handler {node_id!r} must accept VisitLimitExceeded and StepLimitExceeded"
+                        assert node.in_type is LimitExceeded, \
+                            f"Limit handler {node_id!r} must accept LimitExceeded as input"
                         topology = {n: [*sucs, node_id] if sucs and n != node_id else sucs for n, sucs in topology.items()}
                     case _:
                         raise ValueError(f"{node_id!r} is not a valid node implementation")
@@ -309,9 +331,13 @@ class Graph[I: BaseModel, StepId, NodeId](AbstractNode):
 
     async def run(self, input: I) -> tuple[BaseModel, Metadata]:
         """Node interface — used when this Graph is nested inside another."""
-        last = (await run_from(self.nodes, self.topology, self.id_factory, self.initial, input,
-                               max_visits=self.max_visits, max_steps=self.max_steps, acyclic=self.acyclic))[-1]
-        return last.output, last.metadata
+        trace = await run_from(
+            self.nodes, self.topology, self.id_factory, self.initial, input,
+            max_visits = self.max_visits,
+            max_steps  = self.max_steps,
+            acyclic    = self.acyclic,
+        )
+        return trace[-1].output, _total_metadata([e.metadata for e in trace])
 
     async def execute(self, input: I) -> Trace[StepId, NodeId]:
         """Top-level execution — returns the full trace."""
